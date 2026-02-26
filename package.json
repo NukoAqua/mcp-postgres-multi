@@ -23,6 +23,12 @@
     "build": "tsc && shx chmod +x dist/index.js",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration --no-file-parallelism",
+    "test:coverage": "vitest run --coverage",
+    "test:integration:up": "docker compose -f docker-compose.test.yml up -d --wait",
+    "test:integration:down": "docker compose -f docker-compose.test.yml down -v",
     "prepare": "npm run build"
   },
   "keywords": [
@@ -49,10 +55,13 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^2.1.8",
     "@types/node": "^20.11.0",
     "@types/pg": "^8.11.10",
     "shx": "^0.3.4",
-    "typescript": "^5.6.2"
+    "tsx": "^4.19.3",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.8"
   },
   "engines": {
     "node": ">=18.0.0"
