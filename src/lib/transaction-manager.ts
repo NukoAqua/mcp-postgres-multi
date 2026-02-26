@@ -22,9 +22,10 @@ export class TransactionManager {
   /**
    * Add a new transaction to the manager
    */
-  addTransaction(id: string, client: pg.PoolClient, sql: string): void {
+  addTransaction(id: string, client: pg.PoolClient, sql: string, database: string): void {
     this.activeTransactions.set(id, {
       id,
+      database,
       client,
       startTime: Date.now(),
       sql: sql.substring(0, 100), // Store beginning of query for debugging

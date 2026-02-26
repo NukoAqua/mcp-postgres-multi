@@ -1,92 +1,4 @@
-export async function handleExecuteRollback(
-  transactionManager: TransactionManager, 
-  transactionId: string
-) {
-  if (!transactionId) {
-    return {
-      content: [{ type: "text", text: "Error: No transaction ID provided" }],
-      isError: true,
-    };
-  }
-  
-  // Check if transaction exists
-  if (!transactionManager.hasTransaction(transactionId)) {
-    return {
-      content: [{ 
-        type: "text", 
-        text: JSON.stringify({
-          status: "error",
-          message: "Transaction not found or already rolled back",
-          transaction_id: transactionId
-        }, null, 2) 
-      }],
-      isError: true,
-    };
-  }
-  
-  // Get the transaction data
-  const transaction = transactionManager.getTransaction(transactionId)!;
-  
-  // Check if already released
-  if (transaction.released) {
-    transactionManager.removeTransaction(transactionId);
-    return {
-      content: [{ 
-        type: "text", 
-        text: JSON.stringify({
-          status: "error",
-          message: "Transaction client already released",
-          transaction_id: transactionId
-        }, null, 2) 
-      }],
-      isError: true,
-    };
-  }
-  
-  try {
-    // Rollback the transaction
-    await transaction.client.query("ROLLBACK");
-    
-    // Mark as released before actually releasing
-    transaction.released = true;
-    safelyReleaseClient(transaction.client);
-    
-    // Clean up
-    transactionManager.removeTransaction(transactionId);
-    
-    return {
-      content: [{ 
-        type: "text", 
-        text: JSON.stringify({
-          status: "rolled_back",
-          message: "Transaction successfully rolled back",
-          transaction_id: transactionId
-        }, null, 2) + "\n\nTransaction has been successfully rolled back. No changes have been made to the database.\n\nThank you for using PostgreSQL Full Access MCP Server. Is there anything else you'd like to do with your database?"
-      }],
-      isError: false,
-    };
-  } catch (error: any) {
-    // If there's an error during rollback
-    // Mark as released before actually releasing
-    transaction.released = true;
-    safelyReleaseClient(transaction.client);
-    
-    // Clean up
-    transactionManager.removeTransaction(transactionId);
-    
-    return {
-      content: [{ 
-        type: "text", 
-        text: JSON.stringify({
-          status: "error",
-          message: `Error rolling back transaction: ${error.message}`,
-          transaction_id: transactionId
-        }, null, 2) 
-      }],
-      isError: true,
-    };
-  }
-}import pg from "pg";
+import pg from "pg";
 import { TransactionManager } from "./transaction-manager.js";
 import { isReadOnlyQuery, safelyReleaseClient, generateTransactionId } from "./utils.js";
 import { SCHEMA_PATH } from "./types.js";
@@ -95,19 +7,17 @@ export async function handleExecuteQuery(pool: pg.Pool, sql: string) {
   const client = await pool.connect();
   try {
     if (!sql) {
-      safelyReleaseClient(client);
       return {
         content: [{ type: "text", text: "Error: No SQL query provided" }],
         isError: true,
       };
     }
-    
+
     // Validate that the query is read-only
     if (!isReadOnlyQuery(sql)) {
-      safelyReleaseClient(client);
       return {
-        content: [{ 
-          type: "text", 
+        content: [{
+          type: "text",
           text: "Error: Only SELECT queries are allowed with execute_query. For other operations, use execute_dml_ddl_dcl_tcl."
         }],
         isError: true,
@@ -116,48 +26,55 @@ export async function handleExecuteQuery(pool: pg.Pool, sql: string) {
     
     // Execute the query in a read-only transaction
     await client.query("BEGIN TRANSACTION READ ONLY");
-    const startTime = Date.now();
-    const result = await client.query(sql);
-    const execTime = Date.now() - startTime;
-    
-    await client.query("COMMIT");
-    
-    return {
-      content: [{ 
-        type: "text", 
-        text: JSON.stringify({
-          rows: result.rows,
-          rowCount: result.rowCount,
-          fields: result.fields.map(f => ({
-            name: f.name,
-            dataTypeID: f.dataTypeID
-          })),
-          execution_time_ms: execTime
-        }, null, 2) 
-      }],
-      isError: false,
-    };
+    try {
+      const startTime = Date.now();
+      const result = await client.query(sql);
+      const execTime = Date.now() - startTime;
+
+      await client.query("COMMIT");
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            rows: result.rows,
+            rowCount: result.rowCount,
+            fields: result.fields.map(f => ({
+              name: f.name,
+              dataTypeID: f.dataTypeID
+            })),
+            execution_time_ms: execTime
+          }, null, 2)
+        }],
+        isError: false,
+      };
+    } catch (queryError) {
+      // ROLLBACK is essential for PgBouncer transaction pooling mode;
+      // without it the aborted transaction leaks to the next borrower.
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+      throw queryError;
+    }
   } finally {
     safelyReleaseClient(client);
   }
 }
 
 export async function handleExecuteDML(
-  pool: pg.Pool, 
-  transactionManager: TransactionManager, 
+  pool: pg.Pool,
+  transactionManager: TransactionManager,
   sql: string,
-  transactionTimeoutMs: number
+  transactionTimeoutMs: number,
+  database: string
 ) {
   const client = await pool.connect();
   try {
     if (!sql) {
-      safelyReleaseClient(client);
       return {
         content: [{ type: "text", text: "Error: No SQL statement provided" }],
         isError: true,
       };
     }
-    
+
     // Begin a transaction
     await client.query("BEGIN");
     
@@ -171,13 +88,14 @@ export async function handleExecuteDML(
       const execTime = Date.now() - startTime;
       
       // Store client in active transactions
-      transactionManager.addTransaction(transactionId, client, sql);
+      transactionManager.addTransaction(transactionId, client, sql, database);
       
       // Don't release the client - it's now associated with the transaction
       
       // Format a more user-friendly message that prompts for commit
       const resultObj = {
         transaction_id: transactionId,
+        database,
         status: "pending",
         result: {
           command: result.command,
@@ -196,17 +114,21 @@ export async function handleExecuteDML(
       };
     } catch (error: any) {
       // If there's an error, roll back and release the client
-      await client.query("ROLLBACK");
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("ROLLBACK failed after SQL error:", rollbackErr);
+      }
       safelyReleaseClient(client);
-      
+
       return {
-        content: [{ 
-          type: "text", 
+        content: [{
+          type: "text",
           text: JSON.stringify({
             status: "error",
             message: `Error executing statement: ${error.message}`,
             sql: sql
-          }, null, 2) 
+          }, null, 2)
         }],
         isError: true,
       };
@@ -225,7 +147,6 @@ export async function handleExecuteMaintenance(
   const client = await pool.connect();
   try {
     if (!sql) {
-      safelyReleaseClient(client);
       return {
         content: [{ type: "text", text: "Error: No SQL statement provided" }],
         isError: true,
@@ -234,9 +155,9 @@ export async function handleExecuteMaintenance(
 
     // Check if the SQL is a maintenance command
     // VACUUM, ANALYZE, CREATE DATABASE can't be executed in a transaction
-    const isMaintenanceCommand = /^(VACUUM|ANALYZE|CREATE DATABASE)/i.test(sql.trim());
-    if (!isMaintenanceCommand) {
-      safelyReleaseClient(client);
+    const trimmedSql = sql.trim();
+    const isMaintenanceCommand = /^(VACUUM|ANALYZE|CREATE DATABASE)/i.test(trimmedSql);
+    if (!isMaintenanceCommand || trimmedSql.includes(';')) {
       return {
         content: [{ type: "text", text: "Error: Only VACUUM, ANALYZE and CREATE DATABASE commands are allowed" }],
         isError: true,
@@ -375,20 +296,22 @@ export async function handleListTables(pool: pg.Pool, schemaName: string = "publ
   const client = await pool.connect();
   try {
     const result = await client.query(`
-      SELECT 
-        t.table_name, 
+      SELECT
+        t.table_name,
         pg_catalog.obj_description(pgc.oid, 'pg_class') as table_description,
-        (SELECT COUNT(*) FROM information_schema.columns c WHERE c.table_name = t.table_name) as column_count
-      FROM 
+        (SELECT COUNT(*) FROM information_schema.columns c WHERE c.table_name = t.table_name AND c.table_schema = $1) as column_count
+      FROM
         information_schema.tables t
-      JOIN 
+      JOIN
         pg_catalog.pg_class pgc ON t.table_name = pgc.relname
-      WHERE 
-        t.table_schema = '${schemaName}'
+      JOIN
+        pg_catalog.pg_namespace pgn ON pgc.relnamespace = pgn.oid AND pgn.nspname = $1
+      WHERE
+        t.table_schema = $1
         AND t.table_type = 'BASE TABLE'
-      ORDER BY 
+      ORDER BY
         t.table_name
-    `);
+    `, [schemaName]);
     
     return {
       content: [{ 
@@ -414,35 +337,36 @@ export async function handleDescribeTable(pool: pg.Pool, tableName: string, sche
   try {
     // Get column information
     const columnsResult = await client.query(`
-      SELECT 
-        column_name, 
-        data_type, 
+      SELECT
+        column_name,
+        data_type,
         character_maximum_length,
         column_default,
         is_nullable,
-        col_description(pg_class.oid, columns.ordinal_position) as column_description
-      FROM 
+        col_description(
+          (SELECT oid FROM pg_class WHERE relname = $1 AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)),
+          columns.ordinal_position
+        ) as column_description
+      FROM
         information_schema.columns
-      JOIN 
-        pg_class ON pg_class.relname = columns.table_name
-      WHERE 
-        columns.table_name = '${tableName}'
-        AND columns.table_schema = '${schemaName}'
-      ORDER BY 
+      WHERE
+        table_name = $1
+        AND table_schema = $2
+      ORDER BY
         ordinal_position
-    `);
+    `, [tableName, schemaName]);
     
     // Get primary key information
     const pkResult = await client.query(`
-      SELECT 
+      SELECT
         a.attname as column_name
-      FROM 
+      FROM
         pg_index i
         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-      WHERE 
-        i.indrelid = '${schemaName}.${tableName}'::regclass
+      WHERE
+        i.indrelid = (SELECT oid FROM pg_class WHERE relname = $1 AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2))
         AND i.indisprimary
-    `);
+    `, [tableName, schemaName]);
     
     // Get foreign key information
     const fkResult = await client.query(`
@@ -458,22 +382,22 @@ export async function handleDescribeTable(pool: pg.Pool, tableName: string, sche
         JOIN information_schema.constraint_column_usage AS ccu
           ON ccu.constraint_name = tc.constraint_name
           AND ccu.table_schema = tc.table_schema
-      WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = '${tableName}' AND tc.table_schema = '${schemaName}'
-    `);
+      WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = $1 AND tc.table_schema = $2
+    `, [tableName, schemaName]);
     
     // Get table description
     const tableDescResult = await client.query(`
       SELECT pg_catalog.obj_description(pgc.oid, 'pg_class') as table_description
       FROM pg_catalog.pg_class pgc
-      WHERE pgc.relname = '${tableName}' AND pgc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '${schemaName}')
-    `);
+      WHERE pgc.relname = $1 AND pgc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)
+    `, [tableName, schemaName]);
     
     // Get approximate row count
     const rowCountResult = await client.query(`
       SELECT reltuples::bigint AS approximate_row_count
       FROM pg_class
-      WHERE relname = '${tableName}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '${schemaName}')
-    `);
+      WHERE relname = $1 AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)
+    `, [tableName, schemaName]);
     
     // Get indexes
     const indexesResult = await client.query(`
@@ -495,14 +419,14 @@ export async function handleDescribeTable(pool: pg.Pool, tableName: string, sche
         AND a.attnum = ANY(ix.indkey)
         AND i.relam = am.oid
         AND t.relkind = 'r'
-        AND t.relname = '${tableName}' AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '${schemaName}')
+        AND t.relname = $1 AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)
       GROUP BY
         i.relname,
         am.amname,
         ix.indisunique
       ORDER BY
         i.relname
-    `);
+    `, [tableName, schemaName]);
     
     return {
       content: [{ 

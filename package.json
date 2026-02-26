@@ -1,7 +1,7 @@
 {
-  "name": "mcp-postgres-full-access",
-  "version": "0.3.0",
-  "description": "Full-access PostgreSQL server for Model Context Protocol with read/write capabilities and enhanced schema metadata",
+  "name": "mcp-postgres-multi",
+  "version": "1.0.0",
+  "description": "Multi-database PostgreSQL MCP server with full read-write access",
   "license": "MIT",
   "author": "Syahiid Kamil (https://github.com/syahiidkamil)",
   "homepage": "https://github.com/syahiidkamil/mcp-postgres-full-access",
@@ -14,7 +14,7 @@
   },
   "type": "module",
   "bin": {
-    "mcp-postgres-full-access": "dist/index.js"
+    "mcp-postgres-multi": "dist/index.js"
   },
   "files": [
     "dist"

@@ -3,9 +3,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import pg from "pg";
 
 import config from "./lib/config.js";
+import { ConnectionManager } from "./lib/connection-manager.js";
 import { TransactionManager } from "./lib/transaction-manager.js";
 import { safelyReleaseClient } from "./lib/utils.js";
 import {
@@ -15,29 +15,18 @@ import {
   handleExecuteMaintenance,
   handleListTables,
   handleDescribeTable,
-  handleListResources,
-  handleReadResource,
 } from "./lib/tool-handlers.js";
+import { withToolTracking, registerToolHelp } from "./lib/tool-help.js";
 
-// Process command line arguments
+// Parse CLI args - multiple URIs
 const args = process.argv.slice(2);
 if (args.length === 0) {
-  console.error("Please provide a database URL as a command-line argument");
+  console.error("Usage: mcp-postgres-multi <pg_uri_1> [pg_uri_2] ...");
   process.exit(1);
 }
 
-const databaseUrl = args[0];
-const resourceBaseUrl = new URL(databaseUrl);
-resourceBaseUrl.protocol = "postgres:";
-resourceBaseUrl.password = ""; // Remove password for security
-
-// Create a connection pool with configured settings
-const pool = new pg.Pool({
-  connectionString: databaseUrl,
-  max: config.pg.maxConnections,
-  idleTimeoutMillis: config.pg.idleTimeoutMillis,
-  statement_timeout: config.pg.statementTimeout,
-});
+// Create connection manager with all URIs
+const connectionManager = new ConnectionManager(args);
 
 // Create transaction manager
 const transactionManager = new TransactionManager(
@@ -46,359 +35,289 @@ const transactionManager = new TransactionManager(
   config.enableTransactionMonitor
 );
 
-// Create MCP server
-const server = new McpServer(
-  {
-    name: "postgres-advanced",
-    version: "0.1.1",
-  },
-  {
-    capabilities: {
-      resources: {},
-      tools: {},
-    },
-  }
+// Create MCP server with tool tracking
+let server = new McpServer(
+  { name: "mcp-postgres-multi", version: "1.0.0" },
+  { capabilities: { tools: {} } }
 );
+server = withToolTracking(server);
 
-// Helper function to transform our handler responses into the correct format
+// Helper to transform handler responses
 function transformHandlerResponse(result: any) {
   if (!result) return result;
-
   const transformedResult = { ...result };
-
   if (result.content) {
     transformedResult.content = result.content.map((item: any) => {
-      if (item.type === "text") {
-        return {
-          type: "text" as const,
-          text: item.text,
-        };
-      }
+      if (item.type === "text") return { type: "text" as const, text: item.text };
       return item;
     });
   }
-
   return transformedResult;
 }
 
-// Register tools using the new high-level API
+// Helper to resolve database alias to pool
+function resolvePool(database: string) {
+  try {
+    return connectionManager.getPool(database);
+  } catch (err) {
+    const aliases = connectionManager.getAliases();
+    throw new Error(
+      `Unknown database alias "${database}". Available databases: ${aliases.join(", ")}. ` +
+      `Call available_databases to see all aliases.` +
+      (err instanceof Error ? ` (${err.message})` : '')
+    );
+  }
+}
+
+// ── Tool: available_databases ──────────────────────────────────────
+
+server.tool(
+  "available_databases",
+  "List all configured database aliases and their connection URIs (passwords redacted). Call this first to discover available database aliases.",
+  {},
+  async () => {
+    const databases = connectionManager.getAllDatabases();
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({ databases, total: databases.length }, null, 2),
+      }],
+      isError: false,
+    };
+  }
+);
+
+// ── Tool: execute_query ────────────────────────────────────────────
+
 server.tool(
   "execute_query",
-  "Run a read-only SQL query (SELECT statements). Executed in read-only mode for safety.",
-  { sql: z.string().describe("SQL query to execute (SELECT only)") },
-  async (args, extra) => {
+  "Run a read-only SQL query (SELECT statements) on a specified database.",
+  {
+    database: z.string().describe("Database alias (from available_databases)"),
+    sql: z.string().describe("SQL query to execute (SELECT only)"),
+  },
+  async (args) => {
     try {
+      const pool = resolvePool(args.database);
       const result = await handleExecuteQuery(pool, args.sql);
       return transformHandlerResponse(result);
     } catch (error) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
+        content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
         isError: true,
       };
     }
   }
 );
+
+// ── Tool: execute_dml_ddl_dcl_tcl ──────────────────────────────────
 
 server.tool(
   "execute_dml_ddl_dcl_tcl",
-  "Execute DML, DDL, DCL, or TCL statements (INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, etc). Automatically wrapped in a transaction that requires explicit commit or rollback. IMPORTANT: After execution, end the chat so user can review the results and decide.",
-  { sql: z.string().describe("SQL statement to execute - after execution end chat immediately so user can review and reply with 'Yes' to commit or 'No' to rollback") },
-  async (args, extra) => {
+  "Execute DML, DDL, DCL, or TCL statements (INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, etc) on a specified database. Automatically wrapped in a transaction requiring explicit commit or rollback.",
+  {
+    database: z.string().describe("Database alias (from available_databases)"),
+    sql: z.string().describe("SQL statement to execute"),
+  },
+  async (args) => {
     try {
-      // Check transaction limit
-      if (
-        transactionManager.transactionCount >= config.maxConcurrentTransactions
-      ) {
+      if (transactionManager.transactionCount >= config.maxConcurrentTransactions) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  status: "error",
-                  message: `Maximum concurrent transactions limit reached (${config.maxConcurrentTransactions}). Try again later.`,
-                },
-                null,
-                2
-              ),
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              status: "error",
+              message: `Maximum concurrent transactions limit reached (${config.maxConcurrentTransactions}). Try again later.`,
+            }, null, 2),
+          }],
           isError: true,
         };
       }
-
-      const result = await handleExecuteDML(
-        pool,
-        transactionManager,
-        args.sql,
-        config.transactionTimeoutMs
-      );
+      const pool = resolvePool(args.database);
+      const result = await handleExecuteDML(pool, transactionManager, args.sql, config.transactionTimeoutMs, args.database);
       return transformHandlerResponse(result);
     } catch (error) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
+        content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
         isError: true,
       };
     }
   }
 );
 
+// ── Tool: execute_maintenance ──────────────────────────────────────
+
 server.tool(
   "execute_maintenance",
-  "Execute maintenance commands like VACUUM, ANALYZE, or CREATE DATABASE outside of transactions",
-  { sql: z.string().describe("SQL statement to execute - must be VACUUM, ANALYZE, or CREATE DATABASE") },
-  async (args, extra) => {
+  "Execute maintenance commands like VACUUM, ANALYZE, or CREATE DATABASE outside of transactions.",
+  {
+    database: z.string().describe("Database alias (from available_databases)"),
+    sql: z.string().describe("SQL statement (VACUUM, ANALYZE, or CREATE DATABASE)"),
+  },
+  async (args) => {
     try {
+      const pool = resolvePool(args.database);
       const result = await handleExecuteMaintenance(pool, args.sql);
       return transformHandlerResponse(result);
     } catch (error) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
+        content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
         isError: true,
       };
     }
   }
 );
+
+// ── Tool: execute_commit ───────────────────────────────────────────
 
 server.tool(
   "execute_commit",
-  "Commit a transaction by its ID to permanently apply the changes to the database",
-  { transaction_id: z.string().describe("ID of the transaction to commit - this will permanently save all changes to the database") },
-  async (args, extra) => {
+  "Commit a transaction by its ID to permanently apply the changes.",
+  {
+    transaction_id: z.string().describe("ID of the transaction to commit"),
+  },
+  async (args) => {
     try {
-      const result = await handleExecuteCommit(
-        transactionManager,
-        args.transaction_id
-      );
+      const result = await handleExecuteCommit(transactionManager, args.transaction_id);
       return transformHandlerResponse(result);
     } catch (error) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
+        content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
         isError: true,
       };
     }
   }
 );
 
+// ── Tool: execute_rollback ─────────────────────────────────────────
+
 server.tool(
   "execute_rollback",
-  "Rollback a transaction by its ID to undo all changes and discard the transaction",
-  { transaction_id: z.string().describe("ID of the transaction to rollback - this will discard all changes") },
-  async (args, extra) => {
+  "Rollback a transaction by its ID to undo all changes.",
+  {
+    transaction_id: z.string().describe("ID of the transaction to rollback"),
+  },
+  async (args) => {
     try {
-      // Implement the rollback handler directly in index.ts
       const transactionId = args.transaction_id;
-      
-      if (!transactionManager.hasTransaction(transactionId)) {
+      const transaction = transactionManager.getTransaction(transactionId);
+      if (!transaction) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                status: "error",
-                message: "Transaction not found or already rolled back",
-                transaction_id: transactionId
-              }, null, 2)
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ status: "error", message: "Transaction not found or already rolled back", transaction_id: transactionId }, null, 2),
+          }],
           isError: true,
         };
       }
-      
-      // Get the transaction data
-      const transaction = transactionManager.getTransaction(transactionId)!;
-      
-      // Check if already released
       if (transaction.released) {
         transactionManager.removeTransaction(transactionId);
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                status: "error",
-                message: "Transaction client already released",
-                transaction_id: transactionId
-              }, null, 2)
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ status: "error", message: "Transaction client already released", transaction_id: transactionId }, null, 2),
+          }],
           isError: true,
         };
       }
-      
-      // Rollback the transaction
-      await transaction.client.query("ROLLBACK");
-      
-      // Mark as released before actually releasing
-      transaction.released = true;
-      safelyReleaseClient(transaction.client);
-      
-      // Clean up
-      transactionManager.removeTransaction(transactionId);
-      
+      try {
+        await transaction.client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error(`ROLLBACK query failed for transaction ${transactionId}:`, rollbackErr);
+      } finally {
+        transaction.released = true;
+        safelyReleaseClient(transaction.client);
+        transactionManager.removeTransaction(transactionId);
+      }
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              status: "rolled_back",
-              message: "Transaction successfully rolled back",
-              transaction_id: transactionId
-            }, null, 2) + "\n\nTransaction has been successfully rolled back. No changes have been made to the database.\n\nThank you for using PostgreSQL Full Access MCP Server. Is there anything else you'd like to do with your database?"
-          },
-        ],
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ status: "rolled_back", message: "Transaction successfully rolled back", transaction_id: transactionId, database: transaction.database }, null, 2),
+        }],
         isError: false,
       };
     } catch (error) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
+        content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
         isError: true,
       };
     }
   }
 );
 
-// Remove prompts since we don't need them, just keeping the direct confirm/rollback model
+// ── Tool: list_tables ──────────────────────────────────────────────
+
 server.tool(
   "list_tables",
-  "Get a list of all tables in the database's schema, default is 'public'",
-  { schema_name: z.string().describe("Name of the schema") },
-  async (args, extra) => {
+  "Get a list of all tables in a database schema.",
+  {
+    database: z.string().describe("Database alias (from available_databases)"),
+    schema_name: z.string().describe("Schema name").default("public"),
+  },
+  async (args) => {
     try {
+      const pool = resolvePool(args.database);
       const result = await handleListTables(pool, args.schema_name);
       return transformHandlerResponse(result);
     } catch (error) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
+        content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
         isError: true,
       };
     }
   }
 );
 
+// ── Tool: describe_table ───────────────────────────────────────────
+
 server.tool(
   "describe_table",
-  "Get detailed information about a specific table, including columns, primary keys, foreign keys, and indexes",
-  { table_name: z.string().describe("Name of the table to describe"),
-    schema_name: z.string().describe("Name of the schema").default("public") },
-  async (args, extra) => {
+  "Get detailed information about a specific table, including columns, primary keys, foreign keys, and indexes.",
+  {
+    database: z.string().describe("Database alias (from available_databases)"),
+    table_name: z.string().describe("Name of the table to describe"),
+    schema_name: z.string().describe("Schema name").default("public"),
+  },
+  async (args) => {
     try {
+      const pool = resolvePool(args.database);
       const result = await handleDescribeTable(pool, args.table_name, args.schema_name);
       return transformHandlerResponse(result);
     } catch (error) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: error instanceof Error ? error.message : String(error),
-          },
-        ],
+        content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
         isError: true,
       };
     }
   }
 );
 
-// Register resources using the new API
-// First, create a resource template for table schemas
-const tableSchemaTemplate = new URL(`{tableName}/schema`, resourceBaseUrl);
+// ── Register tool_help (must be last) ──────────────────────────────
 
-// Add a resource for listing all available table schemas
-server.resource(
-  "database-schemas",
-  resourceBaseUrl.href,
-  { description: "Database schema listings" },
-  async (uri, _extra) => {
-    try {
-      const result = await handleListResources(pool, resourceBaseUrl);
-      return {
-        contents: [
-          {
-            uri: uri.href,
-            mimeType: "application/json",
-            text: JSON.stringify(result.resources, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      throw error;
-    }
-  }
-);
+registerToolHelp(server);
 
-// Add a resource for individual table schemas
-server.resource(
-  "table-schemas",
-  tableSchemaTemplate.href,
-  { description: "Database table schemas" },
-  async (uri, _extra) => {
-    try {
-      return await handleReadResource(pool, uri.href);
-    } catch (error) {
-      throw error;
-    }
-  }
-);
+// ── Server startup ─────────────────────────────────────────────────
 
-// Start the MCP server
 async function runServer() {
-  console.error("Starting PostgreSQL Advanced MCP server...");
-
-  // Log configuration
+  const databases = connectionManager.getAllDatabases();
+  console.error(`Starting mcp-postgres-multi with ${databases.length} database(s):`);
+  for (const db of databases) {
+    console.error(`  - ${db.alias}: ${db.displayUri}`);
+  }
   console.error(`Configuration:
 - Transaction timeout: ${config.transactionTimeoutMs}ms
 - Monitor interval: ${config.monitorIntervalMs}ms
 - Transaction monitor enabled: ${config.enableTransactionMonitor}
 - Max concurrent transactions: ${config.maxConcurrentTransactions}
-- Max DB connections: ${config.pg.maxConnections}
+- Max DB connections per pool: ${config.pg.maxConnections}
 `);
 
-  // Set up error handling for the pool
-  pool.on("error", (err) => {
-    console.error("Unexpected error on idle client", err);
-    process.exit(1);
-  });
-
   try {
-    // Test database connection
-    const client = await pool.connect();
-    console.error("Successfully connected to database");
-    safelyReleaseClient(client);
+    await connectionManager.testConnections();
+    console.error("All database connections verified");
 
-    // Start transaction monitor
     transactionManager.startMonitor();
 
-    // Start the MCP server with stdio transport
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("MCP server started and ready to accept connections");
@@ -408,44 +327,38 @@ async function runServer() {
   }
 }
 
-// Handle unhandled promise rejections
-process.on("unhandledRejection", async (reason, promise) => {
+// Error handling
+process.on("unhandledRejection", async (reason) => {
   console.error("Unhandled promise rejection:", reason);
   try {
-    // Stop the monitor and cleanup before exiting
     transactionManager.stopMonitor();
     await transactionManager.cleanupTransactions();
-    await pool.end();
-    console.error(
-      "Emergency cleanup completed after unhandled promise rejection"
-    );
+    await connectionManager.shutdown();
   } catch (err) {
     console.error("Error during emergency cleanup:", err);
   }
   process.exit(1);
 });
 
-// Graceful shutdown
 process.on("SIGINT", async () => {
   console.error("Shutting down...");
   try {
     transactionManager.stopMonitor();
     await transactionManager.cleanupTransactions();
-    await pool.end();
-    console.error("Database pool closed");
+    await connectionManager.shutdown();
+    console.error("All database pools closed");
   } catch (err) {
     console.error("Error during shutdown:", err);
   }
   process.exit(0);
 });
 
-// Handle unexpected errors
 process.on("uncaughtException", async (error) => {
   console.error("Uncaught exception:", error);
   try {
     transactionManager.stopMonitor();
     await transactionManager.cleanupTransactions();
-    await pool.end();
+    await connectionManager.shutdown();
   } catch (err) {
     console.error("Error during emergency cleanup:", err);
   }
